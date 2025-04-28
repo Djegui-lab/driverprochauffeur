@@ -1,155 +1,173 @@
+// Configuration initiale et imports
+require('dotenv').config({ path: process.env.NODE_ENV === 'production' ? '.env.prod' : '.env' });
 
-// Charger les variables d'environnement
-require('dotenv').config();
-
-// Importer les dépendances
 const admin = require('firebase-admin');
 const sgMail = require('@sendgrid/mail');
 const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
-// Initialiser Express
+// Initialisation de l'application
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
-// Initialiser Firebase Admin
-admin.initializeApp({
-  credential: admin.credential.cert({
-    projectId: process.env.FIREBASE_PROJECT_ID,
-    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
-  }),
-  databaseURL: process.env.FIREBASE_DATABASE_URL
+// Middlewares de sécurité
+app.use(helmet());
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limite chaque IP à 100 requêtes par fenêtre
 });
+app.use(limiter);
 
-// Initialiser SendGrid
+// Validation des variables d'environnement
+const requiredEnvVars = [
+  'FIREBASE_PROJECT_ID',
+  'FIREBASE_CLIENT_EMAIL',
+  'FIREBASE_PRIVATE_KEY',
+  'FIREBASE_DATABASE_URL',
+  'SENDGRID_API_KEY',
+  'SENDGRID_FROM_EMAIL'
+];
+
+const missingVars = requiredEnvVars.filter(v => !process.env[v]);
+if (missingVars.length > 0) {
+  console.error('❌ Variables d\'environnement manquantes:', missingVars);
+  process.exit(1);
+}
+
+// Configuration Firebase Admin
+try {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+    }),
+    databaseURL: process.env.FIREBASE_DATABASE_URL
+  });
+  console.log('✅ Firebase Admin initialisé');
+} catch (error) {
+  console.error('❌ Erreur d\'initialisation Firebase:', error);
+  process.exit(1);
+}
+
+// Configuration SendGrid
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+console.log('✅ SendGrid configuré');
 
 // Templates email
 const emailTemplates = {
   driver_confirm: {
     subject: 'Course confirmée par votre chauffeur',
-    sendgridTemplateId: 'd-81602ae7361f4254b28d4ca883226242',
+    templateId: 'd-81602ae7361f4254b28d4ca883226242',
   },
   driver_cancel: {
     subject: 'Annulation de votre course',
-    sendgridTemplateId: 'd-a4ddb97407384b4fbb9b631ac4e35d57',
+    templateId: 'd-a4ddb97407384b4fbb9b631ac4e35d57',
   }
 };
 
-// Référence à Firestore
+// Database reference
 const db = admin.firestore();
+const reservationsRef = db.collection('reservations');
 
-// Fonction pour gérer les changements de statut
-const handleReservationStatusChange = async (reservationId, reservationData) => {
+// Fonction pour formater la date
+const formatDate = (dateString) => {
+  const date = new Date(dateString);
+  return date.toLocaleString('fr-FR', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+};
+
+// Gestion des statuts de réservation
+async function handleReservationStatusChange(reservationId, reservationData) {
   try {
-    console.log(`🔍 Traitement de la réservation ${reservationId} (statut: ${reservationData.status})`);
+    console.log(`🔍 Traitement réservation ${reservationId}`);
 
-    // Récupérer les infos du chauffeur
+    // Récupération des données du chauffeur
     const driverDoc = await db.collection('drivers').doc(reservationData.driverId).get();
-    const driverData = driverDoc.data();
-
-    if (!driverData) {
-      console.error(`❌ Aucun chauffeur trouvé avec l'ID: ${reservationData.driverId}`);
-      return;
+    if (!driverDoc.exists) {
+      throw new Error(`Chauffeur ${reservationData.driverId} introuvable`);
     }
 
-    // Préparer les données pour l'email (adapté à votre structure de données)
+    const driverData = driverDoc.data();
+    const clientEmail = reservationData.email;
+    
+    if (!clientEmail) {
+      throw new Error('Email client manquant');
+    }
+
+    // Préparation des données pour l'email
     const emailData = {
       reservationId: reservationId.substring(0, 8),
-      clientName: reservationData.name || 'Client', // Champ direct
+      clientName: reservationData.name || 'Client',
       driverName: driverData.name || 'Votre chauffeur',
       driverPhone: driverData.phone || 'Non disponible',
-      date: new Date(reservationData.date), // Conversion de la chaîne en Date
+      date: formatDate(reservationData.date),
       trip: {
         from: reservationData.trip?.from || 'Non spécifié',
         to: reservationData.trip?.to || 'Non spécifié'
       },
-      price: reservationData.price || 0
+      price: (reservationData.price || 0).toFixed(2)
     };
 
-    // Déterminer le template à utiliser
     const templateType = `driver_${reservationData.status}`;
     const template = emailTemplates[templateType];
-    const clientEmail = reservationData.email; // Champ direct
-
+    
     if (!template) {
-      console.warn(`⚠️ Template non trouvé pour le type: ${templateType}`);
-      return;
+      throw new Error(`Template ${templateType} non trouvé`);
     }
 
-    if (!clientEmail) {
-      console.warn(`⚠️ Aucun email client pour la réservation ${reservationId}`);
-      return;
-    }
-
-    // Préparer le message SendGrid
+    // Construction du message SendGrid
     const msg = {
       to: clientEmail,
       from: {
-        email: process.env.SENDGRID_FROM_EMAIL, // Correction de la faute de frappe (SENDGRID au lieu de SENDGRID)
+        email: process.env.SENDGRID_FROM_EMAIL,
         name: 'DriverPro Notifications'
       },
       subject: template.subject,
-      templateId: template.sendgridTemplateId,
-      dynamic_template_data: {
-        clientName: emailData.clientName,
-        driverName: emailData.driverName,
-        reservationId: emailData.reservationId,
-        date: emailData.date.toLocaleString('fr-FR', {
-          weekday: 'long',
-          year: 'numeric',
-          month: 'long',
-          day: 'numeric',
-          hour: '2-digit',
-          minute: '2-digit'
-        }),
-        trip: emailData.trip,
-        price: emailData.price.toFixed(2),
-        driverPhone: emailData.driverPhone
-      }
+      templateId: template.templateId,
+      dynamic_template_data: emailData
     };
 
-    console.log('✉️ Tentative d\'envoi d\'email avec:', {
-      to: msg.to,
-      templateId: msg.templateId
-    });
-
+    console.log('✉️ Envoi email à:', clientEmail);
     await sgMail.send(msg);
-    console.log(`✅ Email envoyé avec succès à ${clientEmail}`);
+    console.log('✅ Email envoyé avec succès');
+
   } catch (error) {
-    console.error('❌ Erreur dans handleReservationStatusChange:', error);
+    console.error('❌ Erreur:', error.message);
     if (error.response) {
-      console.error('Détails de l\'erreur SendGrid:', error.response.body);
+      console.error('Détails SendGrid:', error.response.body);
     }
     throw error;
   }
-};
+}
 
 // Écouteur Firestore
-const setupReservationListener = () => {
-  console.log('🔄 Initialisation de l\'écouteur Firestore...');
+function setupReservationListener() {
+  console.log('🔄 Initialisation écouteur Firestore...');
 
-  return db.collection('reservations')
+  return reservationsRef
     .where('status', 'in', ['confirmed', 'cancelled'])
     .onSnapshot(
       async (snapshot) => {
-        console.log(`📡 ${snapshot.docChanges().length} changement(s) détecté(s)`);
+        console.log(`📡 ${snapshot.docChanges().length} changement(s)`);
         
         for (const change of snapshot.docChanges()) {
           if (change.type === 'modified') {
-            const reservationId = change.doc.id;
-            const newData = change.doc.data();
-            const previousData = change.doc.previous.data; // Sans parenthèses
-
-            console.log(`🔄 Modification réservation ${reservationId}:`, {
-              ancienStatut: previousData.status,
-              nouveauStatut: newData.status
-            });
-
             try {
-              await handleReservationStatusChange(reservationId, newData);
+              await handleReservationStatusChange(change.doc.id, change.doc.data());
             } catch (error) {
-              console.error(`❌ Échec du traitement pour ${reservationId}:`, error);
+              console.error(`Échec traitement réservation ${change.doc.id}:`, error.message);
             }
           }
         }
@@ -159,41 +177,85 @@ const setupReservationListener = () => {
         setTimeout(setupReservationListener, 5000);
       }
     );
-};
+}
 
-// Gestion des erreurs
-process.on('uncaughtException', (error) => {
-  console.error('🚨 Erreur non capturée:', error);
-  if (reservationListener) reservationListener();
-  setTimeout(setupReservationListener, 5000);
+// Gestion des erreurs globales
+process.on('unhandledRejection', (error) => {
+  console.error('🚨 Rejet non géré:', error);
 });
 
-// Route de test
+process.on('uncaughtException', (error) => {
+  console.error('🚨 Exception non capturée:', error);
+  process.exit(1);
+});
+
+// Routes API
+app.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'success',
+    message: 'Service DriverPro Notifications actif',
+    timestamp: new Date().toISOString()
+  });
+});
+
 app.get('/test-email', async (req, res) => {
   try {
     const msg = {
-      to: 'wdjegui45@gmail.com',
+      to: process.env.TEST_EMAIL || 'test@example.com',
       from: process.env.SENDGRID_FROM_EMAIL,
-      subject: 'Test technique',
-      text: 'Ceci est un test technique'
+      subject: 'Test technique DriverPro',
+      text: 'Ceci est un test technique du service de notifications',
+      html: '<strong>Ceci est un test technique</strong>'
     };
     
     await sgMail.send(msg);
-    res.send('Email de test envoyé avec succès');
+    res.json({ status: 'success', message: 'Email de test envoyé' });
   } catch (error) {
     console.error('Erreur test email:', error);
-    res.status(500).send('Erreur lors de l\'envoi du test');
+    res.status(500).json({ 
+      status: 'error',
+      message: 'Échec envoi email',
+      error: error.message 
+    });
   }
 });
 
-// Endpoint de vérification
-app.get('/', (req, res) => {
-  res.status(200).send('✅ Service DriverPro Notifications actif.');
+// Démarrage du serveur
+let server;
+let reservationListener;
+
+async function startServer() {
+  try {
+    reservationListener = setupReservationListener();
+    
+    server = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 Serveur en écoute sur le port ${PORT}`);
+      console.log(`🔗 Environnement: ${process.env.NODE_ENV || 'development'}`);
+    });
+  } catch (error) {
+    console.error('Échec démarrage serveur:', error);
+    process.exit(1);
+  }
+}
+
+// Gestion propre des arrêts
+process.on('SIGTERM', () => {
+  console.log('🛑 Réception SIGTERM - Arrêt propre');
+  if (reservationListener) reservationListener();
+  if (server) server.close(() => {
+    console.log('🔴 Serveur arrêté');
+    process.exit(0);
+  });
 });
 
-// Démarrer le serveur
-let reservationListener = setupReservationListener();
-
-app.listen(PORT, () => {
-  console.log(`🚀 Service en écoute sur le port ${PORT}`);
+process.on('SIGINT', () => {
+  console.log('🛑 Réception SIGINT - Arrêt propre');
+  if (reservationListener) reservationListener();
+  if (server) server.close(() => {
+    console.log('🔴 Serveur arrêté');
+    process.exit(0);
+  });
 });
+
+// Démarrer l'application
+startServer();
